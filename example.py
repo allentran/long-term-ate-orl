@@ -22,7 +22,14 @@ class MarkovRewardProcess(object):
     @staticmethod
     def featurize_sa(states, actions):
         ones = np.ones_like(actions)
-        return np.hstack((states, actions, ones))
+        return np.hstack(
+            (
+                states, states ** 2, states ** 3,
+                actions * states, actions * states ** 2, actions * states ** 3,
+                actions,
+                ones
+            )
+        )
 
     def get_linear_wsa_from_rct_data(self, control_data, treatment_data, pi_a):
         states_control, rewards_control = control_data
@@ -108,33 +115,19 @@ class MarkovRewardProcess(object):
     def _get_ate(self, control_data, treatment_data):
         c_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, control_data[1])
         t_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, treatment_data[1])
+        print(t_rewards.mean() - c_rewards.mean())
         return t_rewards.mean() - c_rewards.mean()
 
     def fit_q(
         self,
         pi_a1: float,
-        states_trajectory,
-        rewards_trajectory,
-        actions_trajectory,
+        s,
+        r,
+        s_next,
+        a,
         val_frac=0.2
     ):
-        weights = np.ones_like(actions_trajectory[:, 0])
-        weights[actions_trajectory[:, 0] == 0.] = 1 - pi_a1
-        weights[actions_trajectory[:, 0] == 1.] = pi_a1
-
-        pos_weights_mask = weights > 0
-        states_trajectory = states_trajectory[pos_weights_mask]
-        rewards_trajectory = rewards_trajectory[pos_weights_mask]
-        actions_trajectory = actions_trajectory[pos_weights_mask]
-        weights = weights[pos_weights_mask]
-
-        s, r, s_next, a = self.get_srs_next_from_rct_data(
-            states_trajectory, rewards_trajectory, actions_trajectory
-        )
-        if pi_a1 == 0.:
-            assert a.mean() == 0.
-        elif pi_a1 == 1.:
-            assert a.mean() == 1.
+        weights = np.ones_like(a)
 
         val_n = int(np.floor(s.shape[0] * val_frac))
         v_mlp = td_model.QModel(self.gamma)
@@ -145,8 +138,9 @@ class MarkovRewardProcess(object):
         )
         return v_mlp
 
-    def doubly_robust_pot_outcome(self, s, a, w_alpha_hat, q_s0, q_error):
-        w_sa = self.featurize_sa(s[:, None], a[:, None]).dot(w_alpha_hat)
+    def doubly_robust_pot_outcome(self, s, a, alpha_hat, q_s0, q_error):
+        w_sa = self.featurize_sa(s[:, None], a[:, None]).dot(alpha_hat)
+        assert q_error.shape[0] == w_sa.shape[0]
         npt.assert_almost_equal(w_sa.mean(), 1., decimal=5)
         return (1 - self.gamma) * q_s0 + np.multiply(w_sa, q_error).mean()
 
@@ -156,47 +150,36 @@ class MarkovRewardProcess(object):
         actions = np.vstack((np.zeros((control_data[0].shape[0], 1)), np.ones((treatment_data[0].shape[0], 1))))
         s, r, s_next, a = self.get_srs_next_from_rct_data(states, rewards, actions)
 
-        p = np.random.permutation(len(states))
+        p = np.random.permutation(len(s))
 
-        mlp_c = self.fit_q(0, control_data[0], control_data[1], np.zeros_like(control_data[0]))
+        mlp_c = self.fit_q(0, s[p], r[p], s_next[p], a[p])
         control_q = mlp_c.predict(mlp_c.best_params, s0[:, None], np.zeros_like(s0[:, None]))
         control_td_error = mlp_c.get_td_error(
             mlp_c.best_params,
             self.gamma,
-            control_data[0][:, 1][:, None],
-            control_data[1][:, 0][:, None],
-            control_data[0][:, 0][:, None],
-            np.zeros((control_data[0].shape[0]))[:, None],
+            s_next[:, None],
+            r[:, None],
+            s[:, None],
+            a[:, None],
             0.
         )
-        w_alpha_hat_0 = self.get_linear_wsa_from_rct_data(control_data, treatment_data, 0.)
-        control_qw = self.doubly_robust_pot_outcome(s, a, w_alpha_hat_0, control_q.mean(), control_td_error)
+        alpha_hat_0 = self.get_linear_wsa_from_rct_data(control_data, treatment_data, 0.)
+        control_qw = self.doubly_robust_pot_outcome(s, a, alpha_hat_0, control_q.mean(), control_td_error)
 
-        mlp_t = self.fit_q(treatment_pi_a1, states[p], rewards[p], actions[p])
+        mlp_t = self.fit_q(treatment_pi_a1, s[p], r[p], s_next[p], a[p])
         actions_under_pi = np.random.binomial(n=1, p=treatment_pi_a1, size=s0.shape[0])
         treatment_q = mlp_t.predict(mlp_t.best_params, s0[:, None], actions_under_pi)
-        if treatment_pi_a1 == 1:
-            treatment_td_error = mlp_t.get_td_error(
-                mlp_t.best_params,
-                self.gamma,
-                treatment_data[0][:, 1][:, None],
-                treatment_data[1][:, 0][:, None],
-                treatment_data[0][:, 0][:, None],
-                np.ones((treatment_data[0].shape[0]))[:, None],
-                1.
-            )
-        else:
-            treatment_td_error = mlp_t.get_td_error(
-                mlp_t.best_params,
-                self.gamma,
-                s_next[:, None],
-                r[:, None],
-                s[:, None],
-                a[:, None],
-                treatment_pi_a1
-            )
-        w_alpha_hat_pi = self.get_linear_wsa_from_rct_data(control_data, treatment_data, treatment_pi_a1)
-        treatment_qw = self.doubly_robust_pot_outcome(s, a, w_alpha_hat_pi, treatment_q.mean(), treatment_td_error)
+        treatment_td_error = mlp_t.get_td_error(
+            mlp_t.best_params,
+            self.gamma,
+            s_next[:, None],
+            r[:, None],
+            s[:, None],
+            a[:, None],
+            treatment_pi_a1
+        )
+        alpha_hat_pi = self.get_linear_wsa_from_rct_data(control_data, treatment_data, treatment_pi_a1)
+        treatment_qw = self.doubly_robust_pot_outcome(s, a, alpha_hat_pi, treatment_q.mean(), treatment_td_error)
         return treatment_qw - control_qw
 
     def fit_rf(self, control_data, features=None, rewards=None):
