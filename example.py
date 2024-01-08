@@ -102,7 +102,6 @@ class MarkovRewardProcess(object):
     def _get_ate(self, control_data, treatment_data):
         c_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, control_data[1])
         t_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, treatment_data[1])
-        print(t_rewards.mean() - c_rewards.mean())
         return t_rewards.mean() - c_rewards.mean()
 
     def fit_q(
@@ -261,7 +260,7 @@ class MarkovRewardProcess(object):
         if n_treatment_periods is not None:
             assert n_treatment_periods > 0
         m = MarkovRewardProcess(0.1, 1)
-        n = 2000
+        n = 1000
         steps = 120
 
         s0, control_data, treatment_data = m.rct_data(
