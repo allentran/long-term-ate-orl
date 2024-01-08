@@ -26,7 +26,7 @@ class ExplicitMLP(nn.Module):
 
 
 class QModel(object):
-    def __init__(self, gamma, features=(128, 1)):
+    def __init__(self, gamma, features=(128, 64, 1)):
         assert features[-1] == 1
 
         self.features = features
