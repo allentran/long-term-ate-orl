@@ -1,7 +1,6 @@
 from typing import Tuple, List
 
 import numpy as np
-import numpy.testing as npt
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 import td_model
@@ -31,27 +30,15 @@ class MarkovRewardProcess(object):
             )
         )
 
-    def get_linear_wsa_from_rct_data(self, control_data, treatment_data, pi_a):
-        states_control, rewards_control = control_data
-        states_treatment, rewards_treatment = treatment_data
-        n = states_control.shape[0] + states_treatment.shape[0]
-        r = np.vstack((rewards_control[:, 0][:, None], rewards_treatment[:, 0][:, None]))
-        s = np.vstack((states_control[:, 0][:, None], states_treatment[:, 0][:, None]))
-        s_next = np.vstack((states_control[:, 1][:, None], states_treatment[:, 1][:, None]))
-        actions = np.vstack(
-            (np.zeros_like(states_control[:, 0][:, None]), np.ones_like(states_treatment[:, 0][:, None]))
-        )
-        a_under_policy = np.random.binomial(n=1, p=pi_a, size=actions.shape[0])[:, None]
-        anext_under_policy = np.random.binomial(n=1, p=pi_a, size=actions.shape[0])[:, None]
-        sa = MarkovRewardProcess.featurize_sa(s, actions)
+    def get_linear_wsa_from_rct_data(self, s, s_next, a, pi_a):
+        n = s.shape[0]
+        sa = MarkovRewardProcess.featurize_sa(s, a)
         s_a0 = MarkovRewardProcess.featurize_sa(s, np.zeros_like(s))
         s_a1 = MarkovRewardProcess.featurize_sa(s, np.ones_like(s))
         s_a_pi_a = (1 - pi_a) * s_a0 + pi_a * s_a1
         s_next_a0 = MarkovRewardProcess.featurize_sa(s_next, np.zeros_like(s))
         s_next_a1 = MarkovRewardProcess.featurize_sa(s_next, np.ones_like(s))
         s_next_a_pi_a = (1 - pi_a) * s_next_a0 + pi_a * s_next_a1
-        # s_a_pi_a = MarkovRewardProcess.featurize_sa(s, a_under_policy)
-        # snext_a_pi_a = MarkovRewardProcess.featurize_sa(s_next, anext_under_policy)
         alpha_hat = np.linalg.solve(
             -self.gamma * s_next_a_pi_a.T.dot(sa) / n + sa.T.dot(sa) / n,
             (1 - self.gamma) * np.mean(s_a_pi_a, axis=0)
@@ -68,12 +55,12 @@ class MarkovRewardProcess(object):
         return states, r, states_next, actions[:, 0]
 
     def generate_trajectory(
-            self,
-            treatment: bool,
-            s0: np.ndarray,
-            steps: int,
-            max_t_for_treatment=np.inf,
-            drift=0.
+        self,
+        treatment: bool,
+        s0: np.ndarray,
+        steps: int,
+        max_t_for_treatment=np.inf,
+        drift=0.
     ):
 
         n = len(s0)
@@ -133,54 +120,74 @@ class MarkovRewardProcess(object):
         v_mlp = td_model.QModel(self.gamma)
         v_mlp.fit_model(
             pi_a1,
-            s_next[val_n:, None], r[val_n:, None], s[val_n:, None], a[val_n:, None], weights[val_n:, None],
-            s_next[:val_n, None], r[:val_n, None], s[:val_n, None], a[:val_n, None], weights[:val_n, None]
+            s_next[val_n:], r[val_n:, None], s[val_n:], a[val_n:, None], weights[val_n:, None],
+            s_next[:val_n], r[:val_n, None], s[:val_n], a[:val_n, None], weights[:val_n, None]
         )
         return v_mlp
 
     def doubly_robust_pot_outcome(self, s, a, alpha_hat, q_s0, q_error):
-        w_sa = self.featurize_sa(s[:, None], a[:, None]).dot(alpha_hat)
+        w_sa = self.featurize_sa(s, a[:, None]).dot(alpha_hat)
         assert q_error.shape[0] == w_sa.shape[0]
-        npt.assert_almost_equal(w_sa.mean(), 1., decimal=5)
         return (1 - self.gamma) * q_s0 + np.multiply(w_sa, q_error).mean()
 
-    def get_ate_qw(self, s0, control_data, treatment_data, treatment_pi_a1):
+    def get_ate_qw(self, s0, s, r, s_next, a, treatment_pi_a1):
+        p = np.random.permutation(s.shape[0])
+        s = s[p]
+        r = r[p]
+        s_next = s_next[p]
+        a = a[p]
+
+        testtrain_idx = np.random.binomial(n=1, p=0.5, size=s.shape[0])
+        control_qws = []
+        treatment_qws = []
+        for train_idx in [0, 1]:
+            train = testtrain_idx == train_idx
+            mlp_c = self.fit_q(0, s[train], r[train], s_next[train], a[train])
+            control_q = mlp_c.predict(mlp_c.best_params, s0, np.zeros_like(s0[:, None]))
+            control_td_error = mlp_c.get_td_error(
+                mlp_c.best_params,
+                self.gamma,
+                s_next[~train],
+                r[~train, None],
+                s[~train],
+                a[~train, None],
+                0.
+            )
+            alpha_hat_0 = self.get_linear_wsa_from_rct_data(
+                s[train], s_next[train], a[train, None], 0.
+            )
+            control_qw = self.doubly_robust_pot_outcome(
+                s[~train], a[~train], alpha_hat_0, control_q.mean(), control_td_error
+            )
+            control_qws.append(float(control_qw))
+
+            mlp_t = self.fit_q(treatment_pi_a1, s[train], r[train], s_next[train], a[train])
+            actions_under_pi = np.random.binomial(n=1, p=treatment_pi_a1, size=s0.shape[0])
+            treatment_q = mlp_t.predict(mlp_t.best_params, s0, actions_under_pi)
+            treatment_td_error = mlp_t.get_td_error(
+                mlp_t.best_params,
+                self.gamma,
+                s_next[~train],
+                r[~train, None],
+                s[~train],
+                a[~train, None],
+                treatment_pi_a1
+            )
+            alpha_hat_pi = self.get_linear_wsa_from_rct_data(
+                s[train], s_next[train], a[train, None], treatment_pi_a1
+            )
+            treatment_qw = self.doubly_robust_pot_outcome(
+                s[~train], a[~train], alpha_hat_pi, treatment_q.mean(), treatment_td_error
+            )
+            treatment_qws.append(treatment_qw)
+        return np.mean(treatment_qws) - np.mean(control_qws)
+
+    def get_ate_qw_from_trajectories(self, s0, control_data, treatment_data, treatment_pi_a1):
         states = np.vstack((control_data[0], treatment_data[0]))
         rewards = np.vstack((control_data[1], treatment_data[1]))
         actions = np.vstack((np.zeros((control_data[0].shape[0], 1)), np.ones((treatment_data[0].shape[0], 1))))
         s, r, s_next, a = self.get_srs_next_from_rct_data(states, rewards, actions)
-
-        p = np.random.permutation(len(s))
-
-        mlp_c = self.fit_q(0, s[p], r[p], s_next[p], a[p])
-        control_q = mlp_c.predict(mlp_c.best_params, s0[:, None], np.zeros_like(s0[:, None]))
-        control_td_error = mlp_c.get_td_error(
-            mlp_c.best_params,
-            self.gamma,
-            s_next[:, None],
-            r[:, None],
-            s[:, None],
-            a[:, None],
-            0.
-        )
-        alpha_hat_0 = self.get_linear_wsa_from_rct_data(control_data, treatment_data, 0.)
-        control_qw = self.doubly_robust_pot_outcome(s, a, alpha_hat_0, control_q.mean(), control_td_error)
-
-        mlp_t = self.fit_q(treatment_pi_a1, s[p], r[p], s_next[p], a[p])
-        actions_under_pi = np.random.binomial(n=1, p=treatment_pi_a1, size=s0.shape[0])
-        treatment_q = mlp_t.predict(mlp_t.best_params, s0[:, None], actions_under_pi)
-        treatment_td_error = mlp_t.get_td_error(
-            mlp_t.best_params,
-            self.gamma,
-            s_next[:, None],
-            r[:, None],
-            s[:, None],
-            a[:, None],
-            treatment_pi_a1
-        )
-        alpha_hat_pi = self.get_linear_wsa_from_rct_data(control_data, treatment_data, treatment_pi_a1)
-        treatment_qw = self.doubly_robust_pot_outcome(s, a, alpha_hat_pi, treatment_q.mean(), treatment_td_error)
-        return treatment_qw - control_qw
+        return self.get_ate_qw(s0[:, None], s[:, None], r, s_next[:, None], a, treatment_pi_a1)
 
     def fit_rf(self, control_data, features=None, rewards=None):
         rf = RandomForestRegressor()
@@ -286,7 +293,7 @@ class MarkovRewardProcess(object):
             treatment_data,
             n_treatment_periods if n_treatment_periods < np.infty else 120
         )
-        ate_qw = m.get_ate_qw(
+        ate_qw = m.get_ate_qw_from_trajectories(
             s0,
             control_data,
             treatment_data,
