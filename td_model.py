@@ -26,7 +26,7 @@ class ExplicitMLP(nn.Module):
 
 
 class QModel(object):
-    def __init__(self, gamma, features=(128, 1)):
+    def __init__(self, gamma, features=(128, 64, 1)):
         assert features[-1] == 1
 
         self.features = features
@@ -41,7 +41,7 @@ class QModel(object):
     ):
         mlp = ExplicitMLP(self.features)
         optimizer = optax.adam(1e-2)
-        l2_penalty = 0.#1e-3
+        l2_penalty = 1e-3
 
         @jax.jit
         def _td_pred(params, s):
@@ -90,7 +90,7 @@ class QModel(object):
             l2_loss_0 = sum(l2_loss(w) for w in jax.tree_util.tree_leaves(params[0]["params"]))
             l2_loss_1 = sum(l2_loss(w) for w in jax.tree_util.tree_leaves(params[1]["params"]))
             per_obs_loss = f(params, target_params, gamma, s_tplus1, r_t, s_t, a_t, pi_a1)
-            return jnp.mean(jnp.multiply(per_obs_loss, weights))# + l2_loss_0 + l2_loss_1
+            return jnp.mean(jnp.multiply(per_obs_loss, weights)) + l2_loss_0 + l2_loss_1
 
         @jax.jit
         def step(params, target_params, opt_state, gamma, s_next, r, s, a, weights, pi_a1):
@@ -108,8 +108,8 @@ class QModel(object):
         treatment_params = mlp.init(key1, s[0])
         control_params = mlp.init(key2, s[0])
         n_layers = len(mlp.features)
-        control_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([0.5])
-        treatment_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([0.5])
+        control_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([r[a == 0].mean()])
+        treatment_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([r[a == 1].mean()])
         mlp_params = (control_params, treatment_params)
         best_params = mlp_params
         opt_state = optimizer.init(mlp_params)
@@ -117,20 +117,8 @@ class QModel(object):
         iters_since_best_loss = 0
         cnt = 0
         best_params_updated = False
-        update_target_steps = 32
+        update_target_steps = 16
         target_params = mlp_params
-
-        # if pi_a1 == 1 or pi_a1 == 0:
-        #     mask = a == pi_a1
-        #     s = s[mask]
-        #     s_next = s_next[mask]
-        #     r = r[mask]
-        #     a = a[mask]
-        #     mask = val_a == pi_a1
-        #     val_s = val_s[mask]
-        #     val_s_next = val_s_next[mask]
-        #     val_r = val_r[mask]
-        #     val_a = val_a[mask]
 
         while True:
             cnt += 1
