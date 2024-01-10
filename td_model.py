@@ -12,7 +12,7 @@ class ExplicitMLP(nn.Module):
     features: Sequence[int]
 
     def setup(self):
-        self.layers = [nn.Dense(feat) for feat in self.features]
+        self.layers = [nn.Dense(feat, use_bias=False) for feat in self.features]
 
     def __call__(self, inputs):
         x = inputs
@@ -107,9 +107,6 @@ class QModel(object):
         key1, key2 = jax.random.split(jax.random.PRNGKey(0), 2)
         treatment_params = mlp.init(key1, s[0])
         control_params = mlp.init(key2, s[0])
-        n_layers = len(mlp.features)
-        control_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([r[a == 0].mean()])
-        treatment_params['params'][f'layers_{n_layers - 1}']['bias'] = jnp.array([r[a == 1].mean()])
         mlp_params = (control_params, treatment_params)
         best_params = mlp_params
         opt_state = optimizer.init(mlp_params)
