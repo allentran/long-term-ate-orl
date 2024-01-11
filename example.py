@@ -1,5 +1,6 @@
 from typing import Tuple, List
 
+from experiment_helpers import ExperimentHelpers
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
@@ -102,6 +103,7 @@ class MarkovRewardProcess(object):
     def _get_ate(self, control_data, treatment_data):
         c_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, control_data[1])
         t_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, treatment_data[1])
+        print(t_rewards.mean(), c_rewards.mean())
         return t_rewards.mean() - c_rewards.mean()
 
     def fit_q(
@@ -255,6 +257,39 @@ class MarkovRewardProcess(object):
         return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
     @staticmethod
+    def coverage_xp(n_treatment_periods, filter_prob: float):
+        assert n_treatment_periods is not None
+        assert n_treatment_periods > 0
+        m = MarkovRewardProcess(0.1, 1)
+        n = 1000
+        steps = 120
+
+        s0, control_data, treatment_data = m.rct_data(
+            n,
+            steps,
+            n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
+            0
+        )
+        ate_true_drift = m._get_ate(control_data, treatment_data)
+        control_data = ExperimentHelpers.filter_by_initial_state(control_data, filter_prob, 0.2, 0.8)
+        treatment_data = ExperimentHelpers.filter_by_initial_state(treatment_data, filter_prob,  0.2, 0.8)
+        ate_qw = m.get_ate_qw_from_trajectories(
+            s0,
+            control_data,
+            treatment_data,
+            1 - m.gamma ** n_treatment_periods if n_treatment_periods < np.infty else 1.
+        )
+        print(
+            f'{n_treatment_periods}-period ATE: {ate_true_drift:.3f}, '
+            f'Q Estimate: {ate_qw:.3f}'
+        )
+        return {
+            'T': n_treatment_periods,
+            'ate': ate_true_drift,
+            'ate_qw': ate_qw
+        }
+
+    @staticmethod
     def compare_under_short(n_treatment_periods=None):
         assert n_treatment_periods is not None
         if n_treatment_periods is not None:
@@ -319,10 +354,20 @@ class MarkovRewardProcess(object):
         }
 
     @staticmethod
+    def coverage_experiment_monte_carlo(n_reps):
+        results = []
+        T = 12
+        for prob_scale in [0.01, 0.1, 0.2, 0.5, 1]:
+            for _ in range(n_reps):
+                results.append(MarkovRewardProcess.coverage_xp(T, prob_scale))
+
+        pd.DataFrame(results).to_csv('coverage.xp.csv', index=False)
+
+    @staticmethod
     def monte_carlo(n_reps: int, Ts: List[float]):
         results = []
-        for _ in range(n_reps):
-            for T in Ts:
+        for T in Ts:
+            for _ in range(n_reps):
                 results.append(MarkovRewardProcess.compare_under_short(T))
 
         pd.DataFrame(results).to_csv('qw_vs_surrogates.csv', index=False)
@@ -331,5 +376,6 @@ class MarkovRewardProcess(object):
 if __name__ == "__main__":
     # MarkovRewardProcess.compare_under_permanent()
     np.random.seed(2023)
-    Ts = [1, 6, 12, 24, 48, np.infty][::-1]
-    MarkovRewardProcess.monte_carlo(n_reps=20, Ts=Ts)
+    # Ts = [1, 6, 12, 24, 48, np.infty][::-1]
+    # MarkovRewardProcess.monte_carlo(n_reps=20, Ts=Ts)
+    MarkovRewardProcess.coverage_experiment_monte_carlo(20)
