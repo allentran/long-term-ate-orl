@@ -7,17 +7,9 @@ from sklearn.ensemble import RandomForestRegressor
 import td_model
 
 
-class MarkovRewardProcess(object):
-    eps = 1e-5
-
-    def __init__(self, sigma, slope, gamma=0.9, treatment_effect_s=0.1, treatment_effect_r=0.1):
-        self.sigma = sigma
-        self.slope = slope
+class Estimators(object):
+    def __init__(self, gamma):
         self.gamma = gamma
-        self.treatment_effect_states = treatment_effect_s
-        self.treatment_effect_reward = treatment_effect_r
-        self.reward_slope = 1
-        self.reward_curvature = 0.5
 
     @staticmethod
     def featurize_sa(states, actions):
@@ -33,12 +25,12 @@ class MarkovRewardProcess(object):
 
     def get_linear_wsa_from_rct_data(self, s, s_next, a, pi_a):
         n = s.shape[0]
-        sa = MarkovRewardProcess.featurize_sa(s, a)
-        s_a0 = MarkovRewardProcess.featurize_sa(s, np.zeros_like(s))
-        s_a1 = MarkovRewardProcess.featurize_sa(s, np.ones_like(s))
+        sa = Estimators.featurize_sa(s, a)
+        s_a0 = Estimators.featurize_sa(s, np.zeros_like(s))
+        s_a1 = Estimators.featurize_sa(s, np.ones_like(s))
         s_a_pi_a = (1 - pi_a) * s_a0 + pi_a * s_a1
-        s_next_a0 = MarkovRewardProcess.featurize_sa(s_next, np.zeros_like(s))
-        s_next_a1 = MarkovRewardProcess.featurize_sa(s_next, np.ones_like(s))
+        s_next_a0 = Estimators.featurize_sa(s_next, np.zeros_like(s))
+        s_next_a1 = Estimators.featurize_sa(s_next, np.ones_like(s))
         s_next_a_pi_a = (1 - pi_a) * s_next_a0 + pi_a * s_next_a1
         alpha_hat = np.linalg.solve(
             -self.gamma * s_next_a_pi_a.T.dot(sa) / n + sa.T.dot(sa) / n,
@@ -46,63 +38,69 @@ class MarkovRewardProcess(object):
         )  # w(s, a) = (s, a, 1)' @ alpha_hat
         return alpha_hat
 
-    def get_srs_next_from_rct_data(
-            self, states_trajectory, rewards_trajectory, actions
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        # Only see the first transition
-        states = states_trajectory[:, 0]
-        states_next = states_trajectory[:, 1]
-        r = rewards_trajectory[:, 0]
-        return states, r, states_next, actions[:, 0]
+    def fit_rf(self, control_data, features=None, rewards=None):
+        rf = RandomForestRegressor()
+        if rewards is not None:
+            cumulative_reward = MarkovDecisionProcess.get_cumulative_reward(self.gamma, rewards)
+        else:
+            cumulative_reward = MarkovDecisionProcess.get_cumulative_reward(self.gamma, control_data[1][:, 1:])
+        if features is not None:
+            rf.fit(features, cumulative_reward)
+        else:
+            rf.fit(control_data[0][:, 1].reshape(-1, 1), cumulative_reward)
+        return rf
 
-    def generate_trajectory(
-        self,
-        treatment: bool,
-        s0: np.ndarray,
-        steps: int,
-        max_t_for_treatment=np.inf,
-        drift=0.
-    ):
+    def get_ate_rf(self, control_data, treatment_data):
+        # surrogates method assume first treatment/surrogate is observed
+        rf = self.fit_rf(control_data)
+        treatment_r0 = treatment_data[1][:, 0] * (1 - self.gamma)
+        control_r0 = control_data[1][:, 0] * (1 - self.gamma)
+        treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
+        control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
+        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
-        n = len(s0)
-        state_trajectory = np.zeros((n, steps + 1))
-        rewards_trajectory = np.zeros((n, steps))
+    def get_ate_rf_mid_surrogate(self, control_data, treatment_data, t_obs_surrogate):
+        # surrogates method assume treatment/surrogate is observed upto (inclusive) t_obs_surrogate
+        treatment_r0 = treatment_data[1][:, 0] * (1 - self.gamma)
+        control_r0 = control_data[1][:, 0] * (1 - self.gamma)
+        if t_obs_surrogate == 0:
+            rf = self.fit_rf(control_data, features=control_data[0][:, 1].reshape(-1, 1))
+            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
+            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
+        else:
+            rf = self.fit_rf(
+                control_data,
+                features=control_data[0][:, t_obs_surrogate].reshape(-1, 1),
+            )
+            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, t_obs_surrogate].reshape(-1, 1)) + treatment_r0
+            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, t_obs_surrogate].reshape(-1, 1)) + control_r0
+        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
-        state_trajectory[:, 0] = s0
-        for t_idx in range(steps):
-            # Simulate state transition based on Gaussian persistence model
-            if treatment and t_idx <= max_t_for_treatment:
-                next_states = state_trajectory[:, t_idx] + np.random.normal(self.treatment_effect_states, self.sigma, n)
-            else:
-                next_states = state_trajectory[:, t_idx] + np.random.normal(0, self.sigma, n)
-            next_states = np.clip(next_states, 0, 1)
-            state_trajectory[:, t_idx + 1] = next_states
+    def get_ate_rf_mid_surrogate_and_reward(self, control_data, treatment_data, t_obs_surrogate):
+        # surrogates method assume treatment/surrogate is observed upto (inclusive) t_obs_surrogate
+        treatment_r0 = MarkovDecisionProcess.get_cumulative_reward(self.gamma, treatment_data[1][:, :t_obs_surrogate])
+        control_r0 = MarkovDecisionProcess.get_cumulative_reward(self.gamma, control_data[1][:, :t_obs_surrogate])
+        if t_obs_surrogate == 0:
+            rf = self.fit_rf(
+                control_data,
+                features=control_data[0][:, 1].reshape(-1, 1),
+                rewards=control_data[1][:, t_obs_surrogate:]
+            )
+            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
+            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
+        else:
+            rf = self.fit_rf(
+                control_data,
+                features=control_data[0][:, t_obs_surrogate].reshape(-1, 1),
+                rewards=control_data[1][:, t_obs_surrogate:]
+            )
+            treatment_rewards_hat = (self.gamma ** t_obs_surrogate) * rf.predict(treatment_data[0][:, t_obs_surrogate].reshape(-1, 1)) + treatment_r0
+            control_rewards_hat = (self.gamma ** t_obs_surrogate) * rf.predict(control_data[0][:, t_obs_surrogate].reshape(-1, 1)) + control_r0
+        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
-            # Compute reward based on the linear reward function
-            if treatment and t_idx <= max_t_for_treatment:
-                rewards_trajectory[:, t_idx] = self.reward_slope * (state_trajectory[:, t_idx] ** self.reward_curvature) + drift * t_idx + self.treatment_effect_states
-            else:
-                rewards_trajectory[:, t_idx] = self.reward_slope * (state_trajectory[:, t_idx] ** self.reward_curvature) + drift * t_idx
-
-        return state_trajectory, rewards_trajectory
-
-    def rct_data(self, n=1000, steps=12, max_t_for_treatment=np.inf, drift=0.):
-        s0 = np.random.uniform(0, 1, n)
-        control_data = self.generate_trajectory(False, s0, steps, max_t_for_treatment, drift)
-        treatment_data = self.generate_trajectory(True, s0, steps, max_t_for_treatment, drift)
-        return s0, control_data, treatment_data
-
-    @staticmethod
-    def get_cumulative_reward(gamma, rewards: np.ndarray):
-        T = rewards.shape[1]
-        gammas = gamma ** np.arange(T)
-        rewards_sum = np.multiply(gammas[None, :], rewards).sum(axis=1)
-        normalization_factor = 1 - gamma
-        return normalization_factor * rewards_sum
-
-    def _get_ate(self, control_data, treatment_data):
-        c_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, control_data[1])
-        t_rewards = MarkovRewardProcess.get_cumulative_reward(self.gamma, treatment_data[1])
+    def get_ate_from_trajectory(self, control_data, treatment_data):
+        c_rewards = MarkovDecisionProcess.get_cumulative_reward(self.gamma, control_data[1])
+        t_rewards = MarkovDecisionProcess.get_cumulative_reward(self.gamma, treatment_data[1])
         print(t_rewards.mean(), c_rewards.mean())
         return t_rewards.mean() - c_rewards.mean()
 
@@ -187,20 +185,8 @@ class MarkovRewardProcess(object):
         states = np.vstack((control_data[0], treatment_data[0]))
         rewards = np.vstack((control_data[1], treatment_data[1]))
         actions = np.vstack((np.zeros((control_data[0].shape[0], 1)), np.ones((treatment_data[0].shape[0], 1))))
-        s, r, s_next, a = self.get_srs_next_from_rct_data(states, rewards, actions)
+        s, r, s_next, a = MarkovDecisionProcess.get_srs_next_from_rct_data(states, rewards, actions)
         return self.get_ate_qw(s0[:, None], s[:, None], r, s_next[:, None], a, treatment_pi_a1)
-
-    def fit_rf(self, control_data, features=None, rewards=None):
-        rf = RandomForestRegressor()
-        if rewards is not None:
-            cumulative_reward = self.get_cumulative_reward(self.gamma, rewards)
-        else:
-            cumulative_reward = self.get_cumulative_reward(self.gamma, control_data[1][:, 1:])
-        if features is not None:
-            rf.fit(features, cumulative_reward)
-        else:
-            rf.fit(control_data[0][:, 1].reshape(-1, 1), cumulative_reward)
-        return rf
 
     def get_naive_scaling_ate(self, control_data, treatment_data, T):
         first_T_periods_weights = (1 - self.gamma ** T) / (1 - self.gamma)
@@ -208,72 +194,109 @@ class MarkovRewardProcess(object):
         control_r0 = control_data[1][:, 0].mean()
         return (1 - self.gamma) * first_T_periods_weights * (treatment_r0 - control_r0)
 
-    def get_ate_rf(self, control_data, treatment_data):
-        # surrogates method assume first treatment/surrogate is observed
-        rf = self.fit_rf(control_data)
-        treatment_r0 = treatment_data[1][:, 0] * (1 - self.gamma)
-        control_r0 = control_data[1][:, 0] * (1 - self.gamma)
-        treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
-        control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
-        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
-    def get_ate_rf_mid_surrogate(self, control_data, treatment_data, t_obs_surrogate):
-        # surrogates method assume treatment/surrogate is observed upto (inclusive) t_obs_surrogate
-        treatment_r0 = treatment_data[1][:, 0] * (1 - self.gamma)
-        control_r0 = control_data[1][:, 0] * (1 - self.gamma)
-        if t_obs_surrogate == 0:
-            rf = self.fit_rf(control_data, features=control_data[0][:, 1].reshape(-1, 1))
-            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
-            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
-        else:
-            rf = self.fit_rf(
-                control_data,
-                features=control_data[0][:, t_obs_surrogate].reshape(-1, 1),
-            )
-            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, t_obs_surrogate].reshape(-1, 1)) + treatment_r0
-            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, t_obs_surrogate].reshape(-1, 1)) + control_r0
-        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
+class MarkovDecisionProcess(object):
+    eps = 1e-5
 
-    def get_ate_rf_mid_surrogate_and_reward(self, control_data, treatment_data, t_obs_surrogate):
-        # surrogates method assume treatment/surrogate is observed upto (inclusive) t_obs_surrogate
-        treatment_r0 = self.get_cumulative_reward(self.gamma, treatment_data[1][:, :t_obs_surrogate])
-        control_r0 = self.get_cumulative_reward(self.gamma, control_data[1][:, :t_obs_surrogate])
-        if t_obs_surrogate == 0:
-            rf = self.fit_rf(
-                control_data,
-                features=control_data[0][:, 1].reshape(-1, 1),
-                rewards=control_data[1][:, t_obs_surrogate:]
-            )
-            treatment_rewards_hat = self.gamma * rf.predict(treatment_data[0][:, 1].reshape(-1, 1)) + treatment_r0
-            control_rewards_hat = self.gamma * rf.predict(control_data[0][:, 1].reshape(-1, 1)) + control_r0
-        else:
-            rf = self.fit_rf(
-                control_data,
-                features=control_data[0][:, t_obs_surrogate].reshape(-1, 1),
-                rewards=control_data[1][:, t_obs_surrogate:]
-            )
-            treatment_rewards_hat = (self.gamma ** t_obs_surrogate) * rf.predict(treatment_data[0][:, t_obs_surrogate].reshape(-1, 1)) + treatment_r0
-            control_rewards_hat = (self.gamma ** t_obs_surrogate) * rf.predict(control_data[0][:, t_obs_surrogate].reshape(-1, 1)) + control_r0
-        return treatment_rewards_hat.mean() - control_rewards_hat.mean()
+    def __init__(self, sigma, slope, gamma=0.9, treatment_effect_s=0.1, treatment_effect_r=0.1):
+        self.sigma = sigma
+        self.slope = slope
+        self.gamma = gamma
+        self.treatment_effect_states = treatment_effect_s
+        self.treatment_effect_reward = treatment_effect_r
+        self.reward_slope = 1
+        self.reward_curvature = 0.5
 
     @staticmethod
-    def coverage_xp(n_treatment_periods, filter_prob: float):
+    def get_srs_next_from_rct_data(states_trajectory, rewards_trajectory, actions) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ]:
+        # Only see the first transition
+        states = states_trajectory[:, 0]
+        states_next = states_trajectory[:, 1]
+        r = rewards_trajectory[:, 0]
+        return states, r, states_next, actions[:, 0]
+
+    def generate_trajectory(
+        self,
+        treatment: bool,
+        s0: np.ndarray,
+        steps: int,
+        max_t_for_treatment=np.inf,
+        hidden_state=False,
+        rho=0.
+    ):
+        n = len(s0)
+        n_states = 2 if hidden_state else 1
+        state_trajectory = np.zeros((n, n_states, steps + 1))
+        rewards_trajectory = np.zeros((n, steps))
+        state_trajectory[:, :, 0] = s0
+        for t_idx in range(steps):
+            # Simulate state transition based on Gaussian persistence model
+            add_treatment_effect = treatment and t_idx <= max_t_for_treatment
+            noise = np.random.normal(0, self.sigma, (n, n_states))
+            curr_state = state_trajectory[:, :, t_idx]
+            if hidden_state:
+                cov = np.array([[1 - rho, 0.], [rho, 1.]])
+                curr_state = curr_state.dot(cov)
+            if add_treatment_effect:
+                next_states = curr_state + noise + self.treatment_effect_states
+            else:
+                next_states = curr_state + noise
+            next_states = np.clip(next_states, 0, 1)
+            state_trajectory[:, :, t_idx + 1] = next_states
+
+            # Compute reward based on the linear reward function
+            if treatment and t_idx <= max_t_for_treatment:
+                rewards_trajectory[:, t_idx] = self.reward_slope * (state_trajectory[:, 0, t_idx] ** self.reward_curvature) + self.treatment_effect_states
+            else:
+                rewards_trajectory[:, t_idx] = self.reward_slope * (state_trajectory[:, 0, t_idx] ** self.reward_curvature)
+
+        if hidden_state:
+            return state_trajectory[:, 0, :], rewards_trajectory
+        return np.squeeze(state_trajectory), rewards_trajectory
+
+    def rct_data(self, n=1000, steps=12, max_t_for_treatment=np.inf):
+        s0 = np.random.uniform(0, 1, n)[:, None]
+        control_data = self.generate_trajectory(False, s0, steps, max_t_for_treatment)
+        treatment_data = self.generate_trajectory(True, s0, steps, max_t_for_treatment)
+        return s0, control_data, treatment_data
+
+    def rct_data_2d(self, n=1000, steps=12, max_t_for_treatment=np.inf, corr=0.):
+        s0 = np.random.uniform(0, 1, (n, 2))
+        control_data = self.generate_trajectory(False, s0, steps, max_t_for_treatment, True, corr)
+        treatment_data = self.generate_trajectory(True, s0, steps, max_t_for_treatment, True, corr)
+        return s0[:, 0][:, None], control_data, treatment_data
+
+    @staticmethod
+    def get_cumulative_reward(gamma, rewards: np.ndarray):
+        T = rewards.shape[1]
+        gammas = gamma ** np.arange(T)
+        rewards_sum = np.multiply(gammas[None, :], rewards).sum(axis=1)
+        normalization_factor = 1 - gamma
+        return normalization_factor * rewards_sum
+
+
+class Experiments(object):
+
+    def __init__(self, gamma):
+        self.estimators = Estimators(gamma)
+
+    def hidden_state_xp(self, n_treatment_periods, corr: float):
         assert n_treatment_periods is not None
         assert n_treatment_periods > 0
-        m = MarkovRewardProcess(0.1, 1)
+        m = MarkovDecisionProcess(0.1, 1)
         n = 1000
         steps = 120
 
-        s0, control_data, treatment_data = m.rct_data(
+        s0, control_data, treatment_data = m.rct_data_2d(
             n,
             steps,
             n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
-            0
+            corr
         )
-        ate_true_drift = m._get_ate(control_data, treatment_data)
-        control_data = ExperimentHelpers.filter_by_initial_state(control_data, filter_prob, 0.2, 0.8)
-        treatment_data = ExperimentHelpers.filter_by_initial_state(treatment_data, filter_prob,  0.2, 0.8)
-        ate_qw = m.get_ate_qw_from_trajectories(
+        ate_true_drift = self.estimators.get_ate_from_trajectory(control_data, treatment_data)
+        ate_qw = self.estimators.get_ate_qw_from_trajectories(
             s0,
             control_data,
             treatment_data,
@@ -286,15 +309,14 @@ class MarkovRewardProcess(object):
         return {
             'T': n_treatment_periods,
             'ate': ate_true_drift,
+            'corr': corr,
             'ate_qw': ate_qw
         }
 
-    @staticmethod
-    def compare_under_short(n_treatment_periods=None):
+    def coverage_xp(self, n_treatment_periods, filter_prob: float):
         assert n_treatment_periods is not None
-        if n_treatment_periods is not None:
-            assert n_treatment_periods > 0
-        m = MarkovRewardProcess(0.1, 1)
+        assert n_treatment_periods > 0
+        m = MarkovDecisionProcess(0.1, 1)
         n = 1000
         steps = 120
 
@@ -302,32 +324,64 @@ class MarkovRewardProcess(object):
             n,
             steps,
             n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
-            0
         )
-        ate_true_drift = m._get_ate(control_data, treatment_data)
-        ate_naive = m.get_naive_scaling_ate(control_data, treatment_data, n_treatment_periods)
-        ate_rf = m.get_ate_rf(control_data, treatment_data)
-        ate_mid_rf = m.get_ate_rf_mid_surrogate(
+        ate_true_drift = self.estimators.get_ate_from_trajectory(control_data, treatment_data)
+        control_data = ExperimentHelpers.filter_by_initial_state(control_data, filter_prob, 0.2, 0.8)
+        treatment_data = ExperimentHelpers.filter_by_initial_state(treatment_data, filter_prob,  0.2, 0.8)
+        ate_qw = self.estimators.get_ate_qw_from_trajectories(
+            s0,
+            control_data,
+            treatment_data,
+            1 - m.gamma ** n_treatment_periods if n_treatment_periods < np.infty else 1.
+        )
+        print(
+            f'{n_treatment_periods}-period ATE: {ate_true_drift:.3f}, '
+            f'Q Estimate: {ate_qw:.3f}'
+        )
+        return {
+            'T': n_treatment_periods,
+            'ate': ate_true_drift,
+            'ate_qw': ate_qw,
+            'filter_prob': filter_prob
+        }
+
+    def compare_estimators(self, n_treatment_periods=None):
+        assert n_treatment_periods is not None
+        if n_treatment_periods is not None:
+            assert n_treatment_periods > 0
+        m = MarkovDecisionProcess(0.1, 1)
+        n = 1000
+        steps = 120
+
+        s0, control_data, treatment_data = m.rct_data(
+            n,
+            steps,
+            n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
+        )
+        ate_true_drift = self.estimators.get_ate_from_trajectory(control_data, treatment_data)
+        ate_naive = self.estimators.get_naive_scaling_ate(control_data, treatment_data, n_treatment_periods)
+        ate_rf = self.estimators.get_ate_rf(control_data, treatment_data)
+        ate_mid_rf = self.estimators.get_ate_rf_mid_surrogate(
             control_data,
             treatment_data,
             int(np.floor(n_treatment_periods / 2)) if n_treatment_periods < np.infty else 120
         )
-        ate_all_rf = m.get_ate_rf_mid_surrogate(
+        ate_all_rf = self.estimators.get_ate_rf_mid_surrogate(
             control_data,
             treatment_data,
             n_treatment_periods if n_treatment_periods < np.infty else 120
         )
-        ate_mid_both_rf = m.get_ate_rf_mid_surrogate_and_reward(
+        ate_mid_both_rf = self.estimators.get_ate_rf_mid_surrogate_and_reward(
             control_data,
             treatment_data,
             int(np.floor(n_treatment_periods / 2)) if n_treatment_periods < np.infty else 120
         )
-        ate_all_both_rf = m.get_ate_rf_mid_surrogate_and_reward(
+        ate_all_both_rf = self.estimators.get_ate_rf_mid_surrogate_and_reward(
             control_data,
             treatment_data,
             n_treatment_periods if n_treatment_periods < np.infty else 120
         )
-        ate_qw = m.get_ate_qw_from_trajectories(
+        ate_qw = self.estimators.get_ate_qw_from_trajectories(
             s0,
             control_data,
             treatment_data,
@@ -353,29 +407,44 @@ class MarkovRewardProcess(object):
             'ate_qw': ate_qw
         }
 
-    @staticmethod
-    def coverage_experiment_monte_carlo(n_reps):
+
+class MonteCarlo(object):
+
+    def __init__(self, gamma):
+        self.experiments = Experiments(gamma)
+
+    def hidden_state_experiment_monte_carlo(self, n_reps):
+        results = []
+        T = np.inf
+        for corr in [0, 0.1, 0.2, 0.5, 1]:
+            for _ in range(n_reps):
+                results.append(self.experiments.hidden_state_xp(T, corr))
+
+        pd.DataFrame(results).to_csv('hidden-state.xp.csv', index=False)
+
+    def coverage_experiment_monte_carlo(self, n_reps):
         results = []
         T = 12
         for prob_scale in [0.01, 0.1, 0.2, 0.5, 1]:
             for _ in range(n_reps):
-                results.append(MarkovRewardProcess.coverage_xp(T, prob_scale))
+                results.append(self.experiments.coverage_xp(T, prob_scale))
 
         pd.DataFrame(results).to_csv('coverage.xp.csv', index=False)
 
-    @staticmethod
-    def monte_carlo(n_reps: int, Ts: List[float]):
+    def vary_treatment_horizon_experiment(self, n_reps: int, Ts: List[float]):
         results = []
         for T in Ts:
             for _ in range(n_reps):
-                results.append(MarkovRewardProcess.compare_under_short(T))
+                results.append(self.experiments.compare_estimators(T))
 
         pd.DataFrame(results).to_csv('qw_vs_surrogates.csv', index=False)
 
 
 if __name__ == "__main__":
-    # MarkovRewardProcess.compare_under_permanent()
     np.random.seed(2023)
-    # Ts = [1, 6, 12, 24, 48, np.infty][::-1]
-    # MarkovRewardProcess.monte_carlo(n_reps=20, Ts=Ts)
-    MarkovRewardProcess.coverage_experiment_monte_carlo(20)
+    gamma = 0.9
+    monte_carlo = MonteCarlo(gamma)
+    Ts = [1, 6, 12, 24, 48, np.infty][::-1]
+    monte_carlo.vary_treatment_horizon_experiment(n_reps=20, Ts=Ts)
+    monte_carlo.coverage_experiment_monte_carlo(20)
+    monte_carlo.hidden_state_experiment_monte_carlo(20)
