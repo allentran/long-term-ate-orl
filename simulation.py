@@ -1,6 +1,5 @@
 from typing import Tuple, List
 
-from experiment_helpers import ExperimentHelpers
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
@@ -98,10 +97,11 @@ class Estimators(object):
             control_rewards_hat = (self.gamma ** t_obs_surrogate) * rf.predict(control_data[0][:, t_obs_surrogate].reshape(-1, 1)) + control_r0
         return treatment_rewards_hat.mean() - control_rewards_hat.mean()
 
-    def get_ate_from_trajectory(self, control_data, treatment_data):
+    def get_ate_from_trajectory(self, control_data, treatment_data, return_all=False):
         c_rewards = MarkovDecisionProcess.get_cumulative_reward(self.gamma, control_data[1])
         t_rewards = MarkovDecisionProcess.get_cumulative_reward(self.gamma, treatment_data[1])
-        print(t_rewards.mean(), c_rewards.mean())
+        if return_all:
+            return t_rewards.mean(), c_rewards.mean()
         return t_rewards.mean() - c_rewards.mean()
 
     def fit_q(
@@ -129,18 +129,18 @@ class Estimators(object):
         assert q_error.shape[0] == w_sa.shape[0]
         return (1 - self.gamma) * q_s0 + np.multiply(w_sa, q_error).mean()
 
-    def get_ate_qw(self, s0, s, r, s_next, a, treatment_pi_a1):
+    def get_ate_qw(self, s0, s, r, s_next, a, treatment_pi_a1, k_folds=5, return_all=False):
         p = np.random.permutation(s.shape[0])
         s = s[p]
         r = r[p]
         s_next = s_next[p]
         a = a[p]
 
-        testtrain_idx = np.random.binomial(n=1, p=0.5, size=s.shape[0])
+        kfold_idxes = np.random.choice(k_folds, size=s.shape[0])
         control_qws = []
         treatment_qws = []
-        for train_idx in [0, 1]:
-            train = testtrain_idx == train_idx
+        for k_fold_idx in range(k_folds):
+            train = kfold_idxes != k_fold_idx
             mlp_c = self.fit_q(0, s[train], r[train], s_next[train], a[train])
             control_q = mlp_c.predict(mlp_c.best_params, s0, np.zeros_like(s0[:, None]))
             control_td_error = mlp_c.get_td_error(
@@ -179,14 +179,19 @@ class Estimators(object):
                 s[~train], a[~train], alpha_hat_pi, treatment_q.mean(), treatment_td_error
             )
             treatment_qws.append(treatment_qw)
+        if return_all:
+            return np.mean(treatment_qws), np.mean(control_qws)
         return np.mean(treatment_qws) - np.mean(control_qws)
 
-    def get_ate_qw_from_trajectories(self, s0, control_data, treatment_data, treatment_pi_a1):
+    def get_ate_qw_from_trajectories(
+            self, s0, control_data, treatment_data, treatment_pi_a1, return_all=False
+    ):
+        T = control_data[1].shape[1]
         states = np.vstack((control_data[0], treatment_data[0]))
         rewards = np.vstack((control_data[1], treatment_data[1]))
-        actions = np.vstack((np.zeros((control_data[0].shape[0], 1)), np.ones((treatment_data[0].shape[0], 1))))
+        actions = np.vstack((np.zeros((control_data[0].shape[0], T)), np.ones((treatment_data[0].shape[0], T))))
         s, r, s_next, a = MarkovDecisionProcess.get_srs_next_from_rct_data(states, rewards, actions)
-        return self.get_ate_qw(s0[:, None], s[:, None], r, s_next[:, None], a, treatment_pi_a1)
+        return self.get_ate_qw(s0[:, None], s[:, None], r, s_next[:, None], a, treatment_pi_a1, return_all=return_all)
 
     def get_naive_scaling_ate(self, control_data, treatment_data, T):
         first_T_periods_weights = (1 - self.gamma ** T) / (1 - self.gamma)
@@ -279,55 +284,64 @@ class MarkovDecisionProcess(object):
 
 class Experiments(object):
 
-    def __init__(self, gamma):
+    def __init__(self, gamma, n_units=1000):
         self.estimators = Estimators(gamma)
+        self.n_units = n_units
+
+    @staticmethod
+    def filter_by_initial_state(data: Tuple[np.ndarray, np.ndarray], p: float, lower: float, upper: float):
+        states, rewards = data
+        n = states.shape[0]
+        in_range = (lower < states[:, 0]) & (states[:, 0] < upper)
+        probs = np.ones(n)
+        probs[in_range] = p
+        probs /= probs.sum()
+        sampled_idxes = np.random.choice(np.arange(n), size=n, replace=True, p=probs)
+        return states[sampled_idxes], rewards[sampled_idxes]
 
     def hidden_state_xp(self, n_treatment_periods, corr: float):
         assert n_treatment_periods is not None
         assert n_treatment_periods > 0
         m = MarkovDecisionProcess(0.1, 1)
-        n = 1000
         steps = 120
 
         s0, control_data, treatment_data = m.rct_data_2d(
-            n,
+            self.n_units,
             steps,
             n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
             corr
         )
-        ate_true_drift = self.estimators.get_ate_from_trajectory(control_data, treatment_data)
-        ate_qw = self.estimators.get_ate_qw_from_trajectories(
+        t_mean, c_mean = self.estimators.get_ate_from_trajectory(control_data, treatment_data, return_all=True)
+        t_qw_mean, c_qw_mean = self.estimators.get_ate_qw_from_trajectories(
             s0,
             control_data,
             treatment_data,
-            1 - m.gamma ** n_treatment_periods if n_treatment_periods < np.infty else 1.
-        )
-        print(
-            f'{n_treatment_periods}-period ATE: {ate_true_drift:.3f}, '
-            f'Q Estimate: {ate_qw:.3f}'
+            1 - m.gamma ** n_treatment_periods if n_treatment_periods < np.infty else 1.,
+            return_all=True
         )
         return {
             'T': n_treatment_periods,
-            'ate': ate_true_drift,
+            'treatment_mean': t_mean,
+            'control_mean': c_mean,
             'corr': corr,
-            'ate_qw': ate_qw
+            'treatment_qw_mean': t_qw_mean,
+            'control_qw_mean': c_qw_mean,
         }
 
     def coverage_xp(self, n_treatment_periods, filter_prob: float):
         assert n_treatment_periods is not None
         assert n_treatment_periods > 0
         m = MarkovDecisionProcess(0.1, 1)
-        n = 1000
         steps = 120
 
         s0, control_data, treatment_data = m.rct_data(
-            n,
+            self.n_units,
             steps,
             n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
         )
         ate_true_drift = self.estimators.get_ate_from_trajectory(control_data, treatment_data)
-        control_data = ExperimentHelpers.filter_by_initial_state(control_data, filter_prob, 0.2, 0.8)
-        treatment_data = ExperimentHelpers.filter_by_initial_state(treatment_data, filter_prob,  0.2, 0.8)
+        control_data = Experiments.filter_by_initial_state(control_data, filter_prob, 0.2, 0.8)
+        treatment_data = Experiments.filter_by_initial_state(treatment_data, filter_prob,  0.2, 0.8)
         ate_qw = self.estimators.get_ate_qw_from_trajectories(
             s0,
             control_data,
@@ -350,11 +364,10 @@ class Experiments(object):
         if n_treatment_periods is not None:
             assert n_treatment_periods > 0
         m = MarkovDecisionProcess(0.1, 1)
-        n = 1000
         steps = 120
 
         s0, control_data, treatment_data = m.rct_data(
-            n,
+            self.n_units,
             steps,
             n_treatment_periods - 1 if n_treatment_periods < np.infty else np.infty,
         )
@@ -442,9 +455,10 @@ class MonteCarlo(object):
 
 if __name__ == "__main__":
     np.random.seed(2023)
+    # Experiments(0.9).use_of_T_data(np.inf, 3)
     gamma = 0.9
     monte_carlo = MonteCarlo(gamma)
     Ts = [1, 6, 12, 24, 48, np.infty][::-1]
-    monte_carlo.vary_treatment_horizon_experiment(n_reps=20, Ts=Ts)
-    monte_carlo.coverage_experiment_monte_carlo(20)
+    # monte_carlo.vary_treatment_horizon_experiment(n_reps=20, Ts=Ts)
+    # monte_carlo.coverage_experiment_monte_carlo(20)
     monte_carlo.hidden_state_experiment_monte_carlo(20)

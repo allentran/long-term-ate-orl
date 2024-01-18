@@ -119,6 +119,8 @@ class QModel(object):
 
         while True:
             cnt += 1
+            # w = 0.9
+            # target_params = jax.tree_map(lambda x, y: w * x + (1. - w) * y, target_params, mlp_params)
             if cnt % update_target_steps == 0:
                 target_params = mlp_params
             iters_since_best_loss += 1
@@ -137,13 +139,13 @@ class QModel(object):
                     iters_since_best_loss = 0
                     best_params_updated = True
 
-                print(
-                    f'\rLoss step {cnt}: {loss:.5f} - {val_loss:.5f} Best={self.min_loss:.5f} Q.val={m:.3f}',
-                    end='',
-                    flush=True
-                )
+                # print(
+                #     f'\rLoss step {cnt}: {loss:.5f} - {val_loss:.5f} Best={self.min_loss:.5f} Q.val={m:.3f}',
+                #     end='',
+                #     flush=True
+                # )
             if iters_since_best_loss > 10000 or self.min_loss < 1e-05 or cnt > 6000:
-                print(self.min_loss)
+                # print(self.min_loss)
                 break
 
         assert best_params_updated
