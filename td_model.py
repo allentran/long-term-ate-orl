@@ -8,6 +8,45 @@ import jax
 from jax import numpy as jnp
 
 
+class DataLoader:
+    def __init__(self, states, next_states, rewards, actions, validation_frac=0.2):
+
+        # Shuffle data
+        indices = np.arange(len(states))
+        np.random.shuffle(indices)
+
+        # Split data into training and validation sets
+        split_idx = int(len(states) * (1 - validation_frac))
+        train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+
+        # Training data
+        self.train_states = states[train_indices]
+        self.train_next_states = next_states[train_indices]
+        self.train_rewards = rewards[train_indices]
+        self.train_actions = actions[train_indices]
+
+        if validation_frac > 0:
+            # Validation data
+            self.val_states = states[val_indices]
+            self.val_next_states = next_states[val_indices]
+            self.val_rewards = rewards[val_indices]
+            self.val_actions = actions[val_indices]
+
+    def get_random_batch(self, batch_size=None):
+        if batch_size:
+            indices = np.random.choice(len(self.train_states), batch_size, replace=False)
+            batch_states = self.train_states[indices]
+            batch_next_states = self.train_next_states[indices]
+            batch_rewards = self.train_rewards[indices]
+            batch_actions = self.train_actions[indices]
+            return batch_states, batch_next_states, batch_rewards, batch_actions
+        else:
+            return self.train_states, self.train_next_states, self.train_rewards, self.train_actions
+
+    def get_validation_batch(self):
+        return self.val_states, self.val_next_states, self.val_rewards, self.val_actions
+
+
 class ExplicitMLP(nn.Module):
     features: Sequence[int]
 
@@ -36,12 +75,13 @@ class QModel(object):
     def fit_model(
             self,
             pi_a1: float,
-            s_next: np.ndarray, r: np.ndarray, s: np.ndarray, a: np.ndarray, weights: np.ndarray,
-            val_s_next: np.ndarray, val_r: np.ndarray, val_s: np.ndarray, val_a: np.ndarray, val_weights: np.ndarray
+            s_next: np.ndarray, r: np.ndarray, s: np.ndarray, a: np.ndarray,
+            batch_size=None,
+            val_frac=None
     ):
         mlp = ExplicitMLP(self.features)
         optimizer = optax.adam(1e-2)
-        l2_penalty = 1e-3
+        l2_penalty = 0#1e-3
 
         @jax.jit
         def _td_pred(params, s):
@@ -83,19 +123,19 @@ class QModel(object):
             return squared_loss
 
         @partial(jax.jit, static_argnums=2)
-        def vmap_td_loss(params, target_params, gamma, s_tplus1, r_t, s_t, a_t, weights, pi_a1):
+        def vmap_td_loss(params, target_params, gamma, s_tplus1, r_t, s_t, a_t, pi_a1):
             def l2_loss(x):
                 return l2_penalty * (x ** 2).mean()
             f = jax.vmap(_td_loss, in_axes=(None, None, None, 0, 0, 0, 0, None))
             l2_loss_0 = sum(l2_loss(w) for w in jax.tree_util.tree_leaves(params[0]["params"]))
             l2_loss_1 = sum(l2_loss(w) for w in jax.tree_util.tree_leaves(params[1]["params"]))
             per_obs_loss = f(params, target_params, gamma, s_tplus1, r_t, s_t, a_t, pi_a1)
-            return jnp.mean(jnp.multiply(per_obs_loss, weights)) + l2_loss_0 + l2_loss_1
+            return jnp.mean(per_obs_loss) + l2_loss_0 + l2_loss_1
 
         @jax.jit
-        def step(params, target_params, opt_state, gamma, s_next, r, s, a, weights, pi_a1):
+        def step(params, target_params, opt_state, gamma, s_next, r, s, a, pi_a1):
             loss_value, grads = jax.value_and_grad(vmap_td_loss, argnums=0)(
-                params, target_params, gamma, s_next, r, s, a, weights, pi_a1
+                params, target_params, gamma, s_next, r, s, a, pi_a1
             )
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
@@ -117,6 +157,10 @@ class QModel(object):
         update_target_steps = 16
         target_params = mlp_params
 
+        data_loader = DataLoader(s, s_next, r, a, validation_frac=val_frac)
+        if val_frac > 0:
+            val_s, val_s_next, val_r, val_a = data_loader.get_validation_batch()
+
         while True:
             cnt += 1
             # w = 0.9
@@ -125,14 +169,25 @@ class QModel(object):
                 target_params = mlp_params
             iters_since_best_loss += 1
             # Perform one gradient update.
+            batch_s, batch_s_next, batch_r, batch_a = data_loader.get_random_batch(batch_size)
             mlp_params, opt_state, loss = step(
-                mlp_params, target_params, opt_state, self.gamma, s_next[:, None], r[:, None], s[:, None], a[:, None], weights[:, None], pi_a1
+                mlp_params,
+                target_params,
+                opt_state,
+                self.gamma,
+                batch_s_next[:, None],
+                batch_r[:, None],
+                batch_s[:, None],
+                batch_a[:, None],
+                pi_a1
             )
             if cnt % 66 == 0:
-                val_loss = vmap_td_loss(
-                    mlp_params, target_params, self.gamma, val_s_next[:, None], val_r[:, None], val_s[:, None], val_a[:, None], val_weights[:, None], pi_a1
-                )
-                m = (vmap_td_pred(mlp_params, val_s, val_a) * val_weights / val_weights.sum(keepdims=True)).sum()
+                if val_frac > 0:
+                    val_loss = vmap_td_loss(
+                        mlp_params, target_params, self.gamma, val_s_next[:, None], val_r[:, None], val_s[:, None], val_a[:, None], pi_a1
+                    )
+                else:
+                    val_loss = loss
                 if val_loss < self.min_loss and cnt > 1000:
                     self.min_loss = val_loss
                     best_params = mlp_params
@@ -140,7 +195,7 @@ class QModel(object):
                     best_params_updated = True
 
                 # print(
-                #     f'\rLoss step {cnt}: {loss:.5f} - {val_loss:.5f} Best={self.min_loss:.5f} Q.val={m:.3f}',
+                #     f'\rLoss step {cnt}: {loss:.5f} - {val_loss:.5f} Best={self.min_loss:.5f}',
                 #     end='',
                 #     flush=True
                 # )
