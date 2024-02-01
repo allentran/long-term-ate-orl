@@ -23,6 +23,7 @@ class SepsisLongTermTreatmentsFlow(FlowSpec):
     n_runs = Parameter('n_runs', type=int, default=100)
     batch_size = Parameter('batch_size', type=int)
     val_frac = Parameter('val_frac', type=float)
+    learning_rate = Parameter('learning_rate', type=float)
 
     @conda(disabled=True)
     @step
@@ -88,7 +89,7 @@ class SepsisLongTermTreatmentsFlow(FlowSpec):
     @step
     def treatment_duration_xp_monte_carlo(self):
         durations_and_actions = list(
-            itertools.product([np.infty], [6])
+            itertools.product([1, 6, 12, 24, 48, np.infty], list(range(1, 8)))
         )
         self.durations_and_actions_x_runs = durations_and_actions * self.n_runs
         self.true_ates = {}
@@ -98,12 +99,12 @@ class SepsisLongTermTreatmentsFlow(FlowSpec):
 
     @titus
     @retry
-    @resources(cpu=16)
+    @resources(cpu=4)
     @step
     def treatment_duration_xp(self):
         duration, action_idx = self.input
         self.results = self.experiments.compare_sepsis_estimators(
-            action_idx, duration, batch_size=self.batch_size, val_frac=self.val_frac
+            action_idx, duration, batch_size=self.batch_size, val_frac=self.val_frac, learning_rate=self.learning_rate
         )
         self.results['ate'] = self.true_ates[(duration, action_idx)]
         self.next(self.merge_duration_xp)

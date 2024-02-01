@@ -115,12 +115,20 @@ class Estimators(object):
         r,
         s_next,
         a,
+        is_nonabs,
+        is_nonabs_next,
         val_frac=0.2,
-        batch_size=None
+        batch_size=None,
+        learning_rate=1e-2,
+        init_params=None
     ):
 
         v_mlp = td_model.QModel(self.gamma)
-        v_mlp.fit_model(pi_a1, s_next, r[:, None], s, a[:, None], batch_size=batch_size, val_frac=val_frac)
+        v_mlp.fit_model(
+            pi_a1,
+            s_next, r[:, None], s, a[:, None], is_nonabs[:, None], is_nonabs_next[:, None],
+            batch_size=batch_size, val_frac=val_frac, learning_rate=learning_rate, init_params=init_params
+        )
         return v_mlp
 
     def doubly_robust_pot_outcome(self, s, a, alpha_hat, q_s0, q_error, polynomial=True):
@@ -130,12 +138,13 @@ class Estimators(object):
 
     def get_ate_qw(
         self,
-        s0, s, r, s_next, a, treatment_pi_a1,
+        s0, s, r, s_next, a, is_nonabs, is_nonabs_next, treatment_pi_a1,
         k_folds=5,
         return_all=False,
         batch_size=None,
         val_frac=None,
-        polynomial=True
+        polynomial=True,
+        learning_rate=1e-2
     ):
         kfold_idxes = np.random.choice(k_folds, size=s.shape[0])
         control_qws = []
@@ -143,9 +152,11 @@ class Estimators(object):
         for k_fold_idx in range(k_folds):
             train = kfold_idxes != k_fold_idx
             mlp_c = self.fit_q(
-                0, s[train], r[train], s_next[train], a[train], val_frac=val_frac, batch_size=batch_size
+                0,
+                s[train], r[train], s_next[train], a[train], is_nonabs[train], is_nonabs_next[train],
+                val_frac=val_frac, batch_size=batch_size, learning_rate=learning_rate
             )
-            control_q = mlp_c.predict(mlp_c.best_params, s0, np.zeros_like(s0[:, None]))
+            control_q = mlp_c.predict(mlp_c.best_params, s0, np.zeros_like(s0[:, None]), np.ones_like(s0[:, None]))
             control_td_error = mlp_c.get_td_error(
                 mlp_c.best_params,
                 self.gamma,
@@ -153,6 +164,8 @@ class Estimators(object):
                 r[~train, None],
                 s[~train],
                 a[~train, None],
+                is_nonabs[~train, None],
+                is_nonabs_next[~train, None],
                 0.
             )
             alpha_hat_0 = self.get_linear_wsa_from_rct_data(
@@ -164,10 +177,13 @@ class Estimators(object):
             control_qws.append(float(control_qw))
 
             mlp_t = self.fit_q(
-                treatment_pi_a1, s[train], r[train], s_next[train], a[train], val_frac=val_frac, batch_size=batch_size
+                treatment_pi_a1,
+                s[train], r[train], s_next[train], a[train], is_nonabs[train], is_nonabs_next[train],
+                val_frac=val_frac, batch_size=batch_size, learning_rate=learning_rate,
+                init_params=mlp_c.best_params
             )
             actions_under_pi = np.random.binomial(n=1, p=treatment_pi_a1, size=s0.shape[0])
-            treatment_q = mlp_t.predict(mlp_t.best_params, s0, actions_under_pi)
+            treatment_q = mlp_t.predict(mlp_t.best_params, s0, actions_under_pi, np.ones_like(s0[:, None]))
             treatment_td_error = mlp_t.get_td_error(
                 mlp_t.best_params,
                 self.gamma,
@@ -175,6 +191,8 @@ class Estimators(object):
                 r[~train, None],
                 s[~train],
                 a[~train, None],
+                is_nonabs[~train, None],
+                is_nonabs_next[~train, None],
                 treatment_pi_a1
             )
             alpha_hat_pi = self.get_linear_wsa_from_rct_data(
@@ -373,19 +391,26 @@ class Experiments(object):
             action_idx, obs_per_state=40, actions_for_t=n_treatment_periods
         )
 
-    def compare_sepsis_estimators(self, action_idx, n_treatment_periods=None, batch_size=None, val_frac=0.2):
+    def compare_sepsis_estimators(
+            self, action_idx, n_treatment_periods=None, batch_size=2000, val_frac=0.0, learning_rate=1e-2
+    ):
         pi_action = 1 - self.estimators.gamma ** n_treatment_periods if n_treatment_periods < np.infty else 1.
-        s0, states, actions, rewards = trajectories.SepsisTrajectories.get_experimental_data(action_idx)
+        s0, states, actions, rewards, is_nonabs = trajectories.SepsisTrajectories.get_experimental_data(
+            action_idx, hidden=False
+        )
         treatment_effect = self.estimators.get_ate_qw(
             s0,
             states[:, :, 0],
             rewards,
             states[:, :, 1],
             actions,
+            is_nonabs[:, 0],
+            is_nonabs[:, 1],
             pi_action,
             val_frac=val_frac,
             batch_size=batch_size,
-            polynomial=False
+            polynomial=False,
+            learning_rate=learning_rate
         )
         return {
             'T': n_treatment_periods,

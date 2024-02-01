@@ -219,26 +219,25 @@ class State(object):
             self.vent_state],
             diabetic_idx=self.diabetic_idx)
 
-    def get_state_vector(self):
-        return np.array([self.hr_state,
-            self.sysbp_state,
-            self.percoxyg_state,
-            self.glucose_state,
-            self.antibiotic_state,
-            self.vaso_state,
-            self.vent_state]).astype(int)
-
-    def get_full_state_vector(self):
-        return np.array(
-            [
-                self.diabetic_idx,
-                self.hr_state,
+    def get_state_vector(self, full=True):
+        if full:
+            return np.array(
+                [
+                    self.diabetic_idx,
+                    self.hr_state,
+                    self.sysbp_state,
+                    self.percoxyg_state,
+                    self.glucose_state,
+                    self.antibiotic_state,
+                    self.vaso_state,
+                    self.vent_state,
+                ]
+            ).astype(int)
+        else:
+            return np.array([self.hr_state,
                 self.sysbp_state,
                 self.percoxyg_state,
                 self.glucose_state,
                 self.antibiotic_state,
                 self.vaso_state,
-                self.vent_state,
-            ]
-        ).astype(int)
-
+                self.vent_state]).astype(int)
